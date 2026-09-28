@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+#
+# ============================================================================
+#  Hermes Agent — Installer & Manager Menu
+#  Target: Ubuntu 24.04 (jalankan sebagai root)
+# ============================================================================
+#
+#  Menu:
+#    1. Setup DeepSeek        → pilih Pro-0813 / V4.1-Flash
+#    2. Setup Custom Model    → base URL + model + API key (endpoint OpenAI-compatible)
+#    3. Change model          → ganti model di instalasi yang sudah ada
+#    4. Status & model aktif  → lihat model, provider, status gateway
+#    5. Restart gateway
+#    6. Lihat log
+#    7. Backup                → seluruh ~/.hermes (config, token, skills, memory) → backup.zip
+#    8. Restore               → pulihkan dari backup.zip (untuk pindah ke VPS baru)
+#    9. Keluar
+#
+#  Cara pakai:  bash hermes-menu.sh
+#
+#  Catatan: saat instalasi Hermes kadang muncul wizard setup.
+#  Kalau muncul, tekan ESC — config ditulis otomatis oleh script ini.
+# ============================================================================
+
 set -uo pipefail
 
 c_ok()   { printf "\033[1;32m✓\033[0m %s\n" "$*"; }
@@ -38,7 +61,12 @@ install_deps() {
   c_head "Install dependency sistem"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || c_warn "apt update ada peringatan"
-  apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
+  apt-get install -y curl ca-certificates git zip unzip >/dev/null 2>&1 || true
+  # Dependency inti untuk Node.js (dipakai Hermes) — libatomic1 WAJIB,
+  # tanpa ini instalasi Hermes gagal: "libatomic.so.1: cannot open shared object file".
+  apt-get install -y libatomic1 libstdc++6 >/dev/null 2>&1 \
+    || c_warn "libatomic1/libstdc++6 gagal dipasang — instalasi Hermes bisa gagal di tahap Node."
+  # Library untuk Chromium headless (browser automation Hermes)
   apt-get install -y \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
     libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
@@ -147,6 +175,11 @@ try:
     with open(p) as f:
         c = yaml.safe_load(f) or {}
 except FileNotFoundError:
+    c = {}
+except yaml.YAMLError:
+    # config.yaml rusak/tidak bisa di-parse → bangun ulang dari nol.
+    # Aman: backup_config sudah menyimpan salinan asli sebelum ini,
+    # dan Setup memang menulis ulang semua key yang diperlukan.
     c = {}
 if not isinstance(c, dict):
     c = {}
@@ -295,11 +328,11 @@ EOF
 setup_deepseek() {
   c_head "Setup DeepSeek — pilih model"
   echo "  1. DeepSeek-V4-Pro-0813   (paling kuat, untuk coding/reasoning)"
-  echo "  2. DeepSeek-V4-Flash-0731 (cepat & murah, tugas ringan)"
+  echo "  2. DeepSeek-V4.1-Flash    (cepat & murah, tugas ringan)"
   local ch; read -rp "Pilih [1/2, default 1]: " ch
   local MODEL
   case "${ch:-1}" in
-    2) MODEL="deepseek/deepseek-v4-flash" ;;
+    2) MODEL="deepseek/deepseek-flash" ;;
     *) MODEL="deepseek/deepseek-v4-pro" ;;
   esac
   c_ok "Model: $MODEL"
@@ -364,14 +397,14 @@ change_model() {
   resolve_python || return 1
 
   echo "  1. DeepSeek-V4-Pro-0813"
-  echo "  2. DeepSeek-V4-Flash-0731"
+  echo "  2. DeepSeek-V4.1-Flash"
   echo "  3. Custom (base URL + model + API key)"
   local ch; read -rp "Pilih [1/2/3]: " ch
 
   case "$ch" in
     1|2)
       local MODEL KEY
-      if [[ "$ch" == "2" ]]; then MODEL="deepseek/deepseek-v4-flash"; else MODEL="deepseek/deepseek-v4-pro"; fi
+      if [[ "$ch" == "2" ]]; then MODEL="deepseek/deepseek-flash"; else MODEL="deepseek/deepseek-v4-pro"; fi
       read -rsp "DeepSeek API Key (ENTER = pakai yang lama, tersembunyi): " KEY; echo
       if [[ -n "$KEY" ]]; then
         touch "$HERMES_DIR/.env"; chmod 600 "$HERMES_DIR/.env"
@@ -454,6 +487,91 @@ view_logs() {
   c_info "Untuk log real-time:  journalctl -u hermes-gateway -f  (Ctrl+C untuk keluar)"
 }
 
+# Pastikan sebuah tool ada; kalau tidak, pasang via apt. ensure_tool <cmd> <paket>
+ensure_tool() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  c_info "Memasang $2..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y "$2" >/dev/null 2>&1
+  command -v "$1" >/dev/null 2>&1 && return 0
+  c_err "Gagal memasang $2. Pasang manual: apt install $2"
+  return 1
+}
+
+# ===========================================================================
+#  OPSI 7 — Backup (seluruh ~/.hermes → backup.zip)
+# ===========================================================================
+backup_all() {
+  c_head "Backup Hermes (config, token, skills, memory)"
+  [[ -d "$HERMES_DIR" ]] || { c_err "$HERMES_DIR tidak ada — belum ada instalasi Hermes."; return 1; }
+  ensure_tool zip zip || return 1
+
+  local out="/root/backup.zip"
+  rm -f "$out"
+  # Backup seluruh isi ~/.hermes, TAPI:
+  #  - hanya file biasa (-type f) → socket/pipe (mis. gateway.sock) otomatis dilewati
+  #    (socket tidak bisa di-zip: "No such device or address"; dibuat ulang saat gateway start)
+  #  - kecualikan log & file .bak (clutter yang tidak perlu)
+  #  - pakai -exec (bukan pipe) → aman untuk nama file berspasi/karakter khusus
+  ( cd /root && find .hermes -type f \
+      ! -path '.hermes/logs/*' ! -name '*.bak.*' \
+      -exec zip -q "$out" {} + ) 2>/dev/null
+
+  if [[ -f "$out" ]]; then
+    c_ok "Backup dibuat: $out ($(du -h "$out" 2>/dev/null | cut -f1))"
+    echo
+    c_warn "PENTING: backup.zip BERISI API key & bot token (rahasia)."
+    c_warn "Jangan upload ke tempat publik / share sembarangan."
+    echo
+    c_info "Pindahkan ke VPS baru:"
+    c_info "  scp $out root@IP_VPS_BARU:~/"
+    c_info "Lalu di VPS baru: jalankan script ini → opsi 8 (Restore)."
+  else
+    c_err "Gagal membuat backup (tidak ada file terbentuk)."
+    return 1
+  fi
+}
+
+# ===========================================================================
+#  OPSI 8 — Restore (pulihkan backup.zip di VPS baru)
+# ===========================================================================
+restore_all() {
+  c_head "Restore Hermes dari backup.zip"
+  local zipf="${HERMES_RESTORE_ZIP:-}"
+  [[ -z "$zipf" ]] && read -rp "Path ke backup.zip [default /root/backup.zip]: " zipf
+  [[ -z "$zipf" ]] && zipf="/root/backup.zip"
+  [[ -f "$zipf" ]] || { c_err "File tidak ditemukan: $zipf"; return 1; }
+  ensure_tool unzip unzip || return 1
+
+  # Proteksi: kalau sudah ada instalasi Hermes di VPS ini, restore akan menimpanya.
+  if [[ -f "$HERMES_DIR/config.yaml" ]]; then
+    c_warn "Terdeteksi instalasi Hermes yang sudah ada di $HERMES_DIR."
+    c_warn "Restore akan MENIMPA config, token, dan skills yang ada sekarang."
+    read -rp "Lanjutkan menimpa? [y/N]: " ow
+    [[ "${ow,,}" == "y" ]] || { c_warn "Restore dibatalkan."; return 1; }
+  fi
+
+  # 1. Pastikan Hermes (binary + venv) terpasang dulu — backup hanya berisi data ~/.hermes,
+  #    bukan program Hermes-nya.
+  install_deps
+  install_hermes || return 1
+
+  # 2. Ekstrak backup → mengembalikan ~/.hermes (config, .env/token, skills, memory)
+  c_info "Mengekstrak backup ke ~/.hermes ..."
+  if ! ( cd /root && unzip -o -q "$zipf" ); then
+    c_err "Gagal mengekstrak $zipf"
+    return 1
+  fi
+  [[ -f "$HERMES_DIR/config.yaml" ]] || { c_err "config.yaml tidak ada setelah ekstrak — backup mungkin rusak / bukan backup Hermes."; return 1; }
+  chmod 600 "$HERMES_DIR/.env" 2>/dev/null || true
+  chmod 600 "$HERMES_DIR/config.yaml" 2>/dev/null || true
+  c_ok "Data Hermes dipulihkan (config, token, skills, memory)"
+
+  # 3. Pasang ulang service (unit systemd tidak ikut backup) + start
+  install_service
+  final_note
+}
+
 # ===========================================================================
 #  MENU UTAMA (loop)
 # ===========================================================================
@@ -466,9 +584,11 @@ while true; do
   echo "  4. Status & model aktif"
   echo "  5. Restart gateway"
   echo "  6. Lihat log"
-  echo "  7. Keluar"
+  echo "  7. Backup               (config, token, skills, memory → backup.zip)"
+  echo "  8. Restore              (pulihkan dari backup.zip — untuk VPS baru)"
+  echo "  9. Keluar"
   echo
-  read -rp "Pilih [1-7]: " MAIN || { echo; c_ok "Keluar."; exit 0; }
+  read -rp "Pilih [1-9]: " MAIN || { echo; c_ok "Keluar."; exit 0; }
   case "$MAIN" in
     1) setup_deepseek ;;
     2) setup_custom ;;
@@ -476,8 +596,10 @@ while true; do
     4) status_and_model ;;
     5) restart_gateway ;;
     6) view_logs ;;
-    7|q|Q) c_ok "Keluar."; exit 0 ;;
-    *) c_err "Pilihan tidak valid (1-7)." ;;
+    7) backup_all ;;
+    8) restore_all ;;
+    9|q|Q) c_ok "Keluar."; exit 0 ;;
+    *) c_err "Pilihan tidak valid (1-9)." ;;
   esac
   echo
   read -rp "Tekan ENTER untuk kembali ke menu..." _
